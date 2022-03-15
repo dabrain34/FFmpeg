@@ -27,6 +27,7 @@
 #include <dlfcn.h>
 #endif
 
+#include <pthread.h>
 #include <unistd.h>
 
 #include "config.h"
@@ -94,6 +95,8 @@ typedef struct VulkanDevicePriv {
     /* Queues */
     uint32_t qfs[5];
     int num_qfs;
+    int *num_queues_in_qf;
+    pthread_mutex_t **qf_mutex;
 
     /* Debug callback */
     VkDebugUtilsMessengerEXT debug_ctx;
@@ -127,6 +130,8 @@ typedef struct VulkanFramesPriv {
 } VulkanFramesPriv;
 
 typedef struct AVVkFrameInternal {
+    pthread_mutex_t update_mutex;
+
 #if CONFIG_CUDA
     /* Importing external memory into cuda is really expensive so we keep the
      * memory imported all the time */
@@ -1304,6 +1309,11 @@ static void vulkan_device_free(AVHWDeviceContext *ctx)
     if (p->libvulkan)
         dlclose(p->libvulkan);
 
+    av_freep(&p->num_queues_in_qf);
+    for (int i = 0; i < p->num_qfs; i++)
+        av_freep(&p->qf_mutex[p->qfs[i]]);
+    av_freep(&p->qf_mutex);
+
     RELEASE_PROPS(hwctx->enabled_inst_extensions, hwctx->nb_enabled_inst_extensions);
     RELEASE_PROPS(hwctx->enabled_dev_extensions, hwctx->nb_enabled_dev_extensions);
 }
@@ -1436,9 +1446,21 @@ end:
     return err;
 }
 
+static void lock_queue(AVHWDeviceContext *ctx, int queue_family, int index)
+{
+    VulkanDevicePriv *p = ctx->internal->priv;
+    pthread_mutex_lock(&p->qf_mutex[queue_family][index]);
+}
+
+static void unlock_queue(AVHWDeviceContext *ctx, int queue_family, int index)
+{
+    VulkanDevicePriv *p = ctx->internal->priv;
+    pthread_mutex_unlock(&p->qf_mutex[queue_family][index]);
+}
+
 static int vulkan_device_init(AVHWDeviceContext *ctx)
 {
-    int err;
+    int err, last_qf = 0;
     uint32_t queue_num;
     AVVulkanDeviceContext *hwctx = ctx->hwctx;
     VulkanDevicePriv *p = ctx->internal->priv;
@@ -1493,6 +1515,16 @@ static int vulkan_device_init(AVHWDeviceContext *ctx)
     enc_index   = hwctx->queue_family_encode_index;
     dec_index   = hwctx->queue_family_decode_index;
 
+    last_qf = FFMAX(graph_index, FFMAX(comp_index, FFMAX(tx_index, FFMAX(enc_index, dec_index))));
+
+    p->qf_mutex = av_mallocz(last_qf*sizeof(*p->qf_mutex));
+    if (!p->qf_mutex)
+        return AVERROR(ENOMEM);
+
+    p->num_queues_in_qf = av_mallocz(last_qf*sizeof(*p->num_queues_in_qf));
+    if (!p->num_queues_in_qf)
+        return AVERROR(ENOMEM);
+
 #define CHECK_QUEUE(type, required, fidx, ctx_qf, qc)                                           \
     do {                                                                                        \
         if (ctx_qf < 0 && required) {                                                           \
@@ -1521,6 +1553,14 @@ static int vulkan_device_init(AVHWDeviceContext *ctx)
         enc_index   = (ctx_qf == enc_index)   ? -1 : enc_index;                                 \
         dec_index   = (ctx_qf == dec_index)   ? -1 : dec_index;                                 \
         p->qfs[p->num_qfs++] = ctx_qf;                                                          \
+                                                                                                \
+        p->num_queues_in_qf[ctx_qf] = qc;                                                       \
+        p->qf_mutex[ctx_qf] = av_mallocz(qc*sizeof(**p->qf_mutex));                             \
+        if (!p->qf_mutex[ctx_qf])                                                               \
+            return AVERROR(ENOMEM);                                                             \
+                                                                                                \
+        for (int i = 0; i < qc; i++)                                                            \
+            pthread_mutex_init(&p->qf_mutex[ctx_qf][i], NULL);                                  \
     } while (0)
 
     CHECK_QUEUE("graphics", 0, graph_index, hwctx->queue_family_index,        hwctx->nb_graphics_queues);
@@ -1530,6 +1570,11 @@ static int vulkan_device_init(AVHWDeviceContext *ctx)
     CHECK_QUEUE("decode",   0, dec_index,   hwctx->queue_family_decode_index, hwctx->nb_decode_queues);
 
 #undef CHECK_QUEUE
+
+    if (!hwctx->lock_queue)
+        hwctx->lock_queue = lock_queue;
+    if (!hwctx->unlock_queue)
+        hwctx->unlock_queue = unlock_queue;
 
     /* Get device capabilities */
     vk->GetPhysicalDeviceMemoryProperties(hwctx->phys_dev, &p->mprops);
@@ -1732,9 +1777,6 @@ static void vulkan_free_internal(AVVkFrame *f)
 {
     AVVkFrameInternal *internal = f->internal;
 
-    if (!internal)
-        return;
-
 #if CONFIG_CUDA
     if (internal->cuda_fc_ref) {
         AVHWFramesContext *cuda_fc = (AVHWFramesContext *)internal->cuda_fc_ref->data;
@@ -1923,9 +1965,11 @@ static int prepare_frame(AVHWFramesContext *hwfc, VulkanExecCtx *ectx,
     uint32_t src_qf, dst_qf;
     VkImageLayout new_layout;
     VkAccessFlags new_access;
+    AVVulkanFramesContext *vkfc = hwfc->hwctx;
     const int planes = av_pix_fmt_count_planes(hwfc->sw_format);
     VulkanDevicePriv *p = hwfc->device_ctx->internal->priv;
     FFVulkanFunctions *vk = &p->vkfn;
+    AVFrame tmp = { .data[0] = (uint8_t *)frame };
     uint64_t sem_sig_val[AV_NUM_DATA_POINTERS];
 
     VkImageMemoryBarrier img_bar[AV_NUM_DATA_POINTERS] = { 0 };
@@ -1944,6 +1988,12 @@ static int prepare_frame(AVHWFramesContext *hwfc, VulkanExecCtx *ectx,
     };
 
     VkPipelineStageFlagBits wait_st[AV_NUM_DATA_POINTERS];
+
+    if ((err = wait_start_exec_ctx(hwfc, ectx)))
+        return err;
+
+    vkfc->lock_frame(hwfc, frame);
+
     for (int i = 0; i < planes; i++) {
         wait_st[i] = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         sem_sig_val[i] = frame->sem_value[i] + 1;
@@ -1980,9 +2030,6 @@ static int prepare_frame(AVHWFramesContext *hwfc, VulkanExecCtx *ectx,
         break;
     }
 
-    if ((err = wait_start_exec_ctx(hwfc, ectx)))
-        return err;
-
     /* Change the image layout to something more optimal for writes.
      * This also signals the newly created semaphore, making it usable
      * for synchronization */
@@ -2008,7 +2055,10 @@ static int prepare_frame(AVHWFramesContext *hwfc, VulkanExecCtx *ectx,
                            VK_PIPELINE_STAGE_TRANSFER_BIT,
                            0, 0, NULL, 0, NULL, planes, img_bar);
 
-    return submit_exec_ctx(hwfc, ectx, &s_info, frame, 0);
+    err = submit_exec_ctx(hwfc, ectx, &s_info, frame, 0);
+    vkfc->unlock_frame(hwfc, frame);
+
+    return err;
 }
 
 static inline void get_plane_wh(int *w, int *h, enum AVPixelFormat format,
@@ -2117,6 +2167,7 @@ static int create_frame(AVHWFramesContext *hwfc, AVVkFrame **frame,
             return AVERROR_EXTERNAL;
         }
 
+        f->queue_family[i] = p->num_qfs > 1 ? VK_QUEUE_FAMILY_IGNORED : p->qfs[0];
         f->layout[i] = create_info.initialLayout;
         f->access[i] = 0x0;
         f->sem_value[i] = 0;
@@ -2257,6 +2308,16 @@ static AVBufferRef *vulkan_pool_alloc(void *opaque, size_t size)
 fail:
     vulkan_frame_free(hwfc, (uint8_t *)f);
     return NULL;
+}
+
+static void lock_frame(AVHWFramesContext *fc, AVVkFrame *vkf)
+{
+    pthread_mutex_lock(&vkf->internal->update_mutex);
+}
+
+static void unlock_frame(AVHWFramesContext *fc, AVVkFrame *vkf)
+{
+    pthread_mutex_unlock(&vkf->internal->update_mutex);
 }
 
 static void vulkan_frames_uninit(AVHWFramesContext *hwfc)
@@ -2420,6 +2481,11 @@ static int vulkan_frames_init(AVHWFramesContext *hwfc)
         if (!hwfc->internal->pool_internal)
             return AVERROR(ENOMEM);
     }
+
+    if (!hwctx->lock_frame)
+        hwctx->lock_frame = lock_frame;
+    if (!hwctx->unlock_frame)
+        hwctx->unlock_frame = unlock_frame;
 
     return 0;
 }
@@ -2809,6 +2875,7 @@ static int vulkan_map_from_drm_frame_desc(AVHWFramesContext *hwfc, AVVkFrame **f
          * offer us anything we could import and sync with, so instead
          * just signal the semaphore we created. */
 
+        f->queue_family[i] = p->num_qfs > 1 ? VK_QUEUE_FAMILY_IGNORED : p->qfs[0];
         f->layout[i] = create_info.initialLayout;
         f->access[i] = 0x0;
         f->sem_value[i] = 0;
@@ -3017,20 +3084,12 @@ static int vulkan_export_to_cuda(AVHWFramesContext *hwfc,
                                                      CU_AD_FORMAT_UNSIGNED_INT8;
 
     dst_f = (AVVkFrame *)frame->data[0];
-
     dst_int = dst_f->internal;
-    if (!dst_int || !dst_int->cuda_fc_ref) {
-        if (!dst_f->internal)
-            dst_f->internal = dst_int = av_mallocz(sizeof(*dst_f->internal));
 
-        if (!dst_int)
-            return AVERROR(ENOMEM);
-
+    if (!dst_int->cuda_fc_ref) {
         dst_int->cuda_fc_ref = av_buffer_ref(cuda_hwfc);
-        if (!dst_int->cuda_fc_ref) {
-            av_freep(&dst_f->internal);
+        if (!dst_int->cuda_fc_ref)
             return AVERROR(ENOMEM);
-        }
 
         for (int i = 0; i < planes; i++) {
             CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC tex_desc = {
@@ -3704,13 +3763,14 @@ static int unmap_buffers(AVHWDeviceContext *ctx, AVBufferRef **bufs,
     return err;
 }
 
-static int transfer_image_buf(AVHWFramesContext *hwfc, const AVFrame *f,
+static int transfer_image_buf(AVHWFramesContext *hwfc, AVFrame *f,
                               AVBufferRef **bufs, size_t *buf_offsets,
                               const int *buf_stride, int w,
                               int h, enum AVPixelFormat pix_fmt, int to_buf)
 {
     int err;
     AVVkFrame *frame = (AVVkFrame *)f->data[0];
+    AVVulkanFramesContext *vkfc = hwfc->hwctx;
     VulkanFramesPriv *fp = hwfc->internal->priv;
     VulkanDevicePriv *p = hwfc->device_ctx->internal->priv;
     FFVulkanFunctions *vk = &p->vkfn;
@@ -3745,11 +3805,13 @@ static int transfer_image_buf(AVHWFramesContext *hwfc, const AVFrame *f,
         .waitSemaphoreCount   = planes,
     };
 
-    for (int i = 0; i < planes; i++)
-        sem_signal_values[i] = frame->sem_value[i] + 1;
+    vkfc->lock_frame(hwfc, frame);
 
     if ((err = wait_start_exec_ctx(hwfc, ectx)))
-        return err;
+        goto end;
+
+    for (int i = 0; i < planes; i++)
+        sem_signal_values[i] = frame->sem_value[i] + 1;
 
     /* Change the image layout to something more optimal for transfers */
     for (int i = 0; i < planes; i++) {
@@ -3824,14 +3886,18 @@ static int transfer_image_buf(AVHWFramesContext *hwfc, const AVFrame *f,
             if (!f->buf[ref])
                 break;
             if ((err = add_buf_dep_exec_ctx(hwfc, ectx, &f->buf[ref], 1)))
-                return err;
+                goto end;
         }
         if (ref && (err = add_buf_dep_exec_ctx(hwfc, ectx, bufs, planes)))
-            return err;
-        return submit_exec_ctx(hwfc, ectx, &s_info, frame, !ref);
+            goto end;
+        err = submit_exec_ctx(hwfc, ectx, &s_info, frame, !ref);
     } else {
-        return submit_exec_ctx(hwfc, ectx, &s_info, frame,    1);
+        err = submit_exec_ctx(hwfc, ectx, &s_info, frame,    1);
     }
+
+end:
+    vkfc->unlock_frame(hwfc, frame);
+    return err;
 }
 
 static int vulkan_transfer_data(AVHWFramesContext *hwfc, const AVFrame *vkf,
@@ -3960,8 +4026,9 @@ static int vulkan_transfer_data(AVHWFramesContext *hwfc, const AVFrame *vkf,
     }
 
     /* Copy buffers into/from image */
-    err = transfer_image_buf(hwfc, vkf, bufs, buf_offsets, tmp.linesize,
-                             swf->width, swf->height, swf->format, from);
+    err = transfer_image_buf(hwfc, (AVFrame *)vkf, bufs, buf_offsets,
+                             tmp.linesize, swf->width, swf->height, swf->format,
+                             from);
 
     if (from) {
         /* Map, copy buffer (which came FROM the VkImage) to the frame, unmap */
@@ -4142,7 +4209,19 @@ static int vulkan_frames_derive_to(AVHWFramesContext *dst_fc,
 
 AVVkFrame *av_vk_frame_alloc(void)
 {
-    return av_mallocz(sizeof(AVVkFrame));
+    AVVkFrame *f = av_mallocz(sizeof(AVVkFrame));
+    if (!f)
+        return NULL;
+
+    f->internal = av_mallocz(sizeof(*f->internal));
+    if (!f->internal) {
+        av_free(f);
+        return NULL;
+    }
+
+    pthread_mutex_init(&f->internal->update_mutex, NULL);
+
+    return f;
 }
 
 const HWContextType ff_hwcontext_type_vulkan = {
