@@ -189,7 +189,7 @@ int ff_vk_alloc_mem(FFVulkanContext *s, VkMemoryRequirements *req,
     };
 
     /* Align if we need to */
-    if (req_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+    if ((req_flags != UINT32_MAX) && req_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
         req->size = FFALIGN(req->size, s->props.limits.minMemoryMapAlignment);
 
     alloc_info.allocationSize = req->size;
@@ -202,7 +202,8 @@ int ff_vk_alloc_mem(FFVulkanContext *s, VkMemoryRequirements *req,
             continue;
 
         /* The memory type flags must include our properties */
-        if ((s->mprops.memoryTypes[i].propertyFlags & req_flags) != req_flags)
+        if ((req_flags != UINT32_MAX) &&
+            ((s->mprops.memoryTypes[i].propertyFlags & req_flags) != req_flags))
             continue;
 
         /* Found a suitable memory type */
@@ -211,7 +212,7 @@ int ff_vk_alloc_mem(FFVulkanContext *s, VkMemoryRequirements *req,
     }
 
     if (index < 0) {
-        av_log(s, AV_LOG_ERROR, "No memory type found for flags 0x%x\n",
+        av_log(s->device, AV_LOG_ERROR, "No memory type found for flags 0x%x\n",
                req_flags);
         return AVERROR(EINVAL);
     }
