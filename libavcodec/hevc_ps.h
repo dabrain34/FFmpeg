@@ -326,6 +326,7 @@ typedef struct HEVCPPS {
     int num_extra_slice_header_bits;
     uint8_t slice_header_extension_present_flag;
     uint8_t log2_max_transform_skip_block_size;
+    uint8_t pps_extension_present_flag;
     uint8_t pps_range_extensions_flag;
     uint8_t cross_component_prediction_enabled_flag;
     uint8_t chroma_qp_offset_list_enabled_flag;
