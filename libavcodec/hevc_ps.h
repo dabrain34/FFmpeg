@@ -210,6 +210,18 @@ typedef struct HEVCSPS {
     VUI vui;
     PTL ptl;
 
+    int sps_extension_present_flag;
+    int sps_scc_extension_flag;
+    int sps_curr_pic_ref_enabled_flag;
+    int palette_mode_enabled_flag;
+    uint8_t palette_max_size;
+    uint8_t delta_palette_max_predictor_size;
+    uint8_t motion_vector_resolution_control_idc;
+    uint8_t sps_num_palette_predictor_initializer_minus1;
+    int sps_palette_predictor_initializer_present_flag;
+    int intra_boundary_filtering_disable_flag;
+    uint16_t palette_predictor_initializers[3][HEVC_PREDICTOR_PALETTE_COMP_ENTRIES_LIST_SIZE];
+
     uint8_t scaling_list_enable_flag;
     int scaling_list_data_present_flag;
     ScalingList scaling_list;
@@ -340,6 +352,20 @@ typedef struct HEVCPPS {
     int8_t  cr_qp_offset_list[6];
     uint8_t log2_sao_offset_scale_luma;
     uint8_t log2_sao_offset_scale_chroma;
+
+    int pps_scc_extension_flag;
+    int pps_curr_pic_ref_enabled_flag;
+    int residual_adaptive_colour_transform_enabled_flag;
+    int pps_slice_act_qp_offsets_present_flag;
+    int pps_palette_predictor_initializer_present_flag;
+    int pps_num_palette_predictor_initializer;
+    int monochrome_palette_flag;
+    int luma_bit_depth_entry_minus8;
+    int chroma_bit_depth_entry_minus8;
+    int pps_act_y_qp_offset_plus5;
+    int pps_act_cb_qp_offset_plus5;
+    int pps_act_cr_qp_offset_plus3;
+    uint16_t palette_predictor_initializers[3][HEVC_PREDICTOR_PALETTE_COMP_ENTRIES_LIST_SIZE];
 
     // Inferred parameters
     unsigned int *column_width;  ///< ColumnWidth
