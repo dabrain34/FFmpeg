@@ -1513,11 +1513,11 @@ static int vulkan_device_init(AVHWDeviceContext *ctx)
 
     last_qf = FFMAX(graph_index, FFMAX(comp_index, FFMAX(tx_index, FFMAX(enc_index, dec_index))));
 
-    p->qf_mutex = av_mallocz(last_qf*sizeof(*p->qf_mutex));
+    p->qf_mutex = av_mallocz((last_qf + 1)*sizeof(*p->qf_mutex));
     if (!p->qf_mutex)
         return AVERROR(ENOMEM);
 
-    p->num_queues_in_qf = av_mallocz(last_qf*sizeof(*p->num_queues_in_qf));
+    p->num_queues_in_qf = av_mallocz((last_qf + 1)*sizeof(*p->num_queues_in_qf));
     if (!p->num_queues_in_qf)
         return AVERROR(ENOMEM);
 
