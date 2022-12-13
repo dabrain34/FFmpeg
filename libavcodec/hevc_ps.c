@@ -855,7 +855,7 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
     HEVCWindow *ow;
     int ret = 0;
     int log2_diff_max_min_transform_block_size;
-    int bit_depth_chroma, start, vui_present, sublayer_ordering_info;
+    int bit_depth_chroma, start;
     int i;
 
     // Coded parameters
@@ -904,7 +904,8 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
                                    sps->height, 0, avctx)) < 0)
         return ret;
 
-    if (get_bits1(gb)) { // pic_conformance_flag
+    sps->conformance_window_flag = get_bits1(gb);
+    if (sps->conformance_window_flag) { // pic_conformance_flag
         int vert_mult  = hevc_sub_height_c[sps->chroma_format_idc];
         int horiz_mult = hevc_sub_width_c[sps->chroma_format_idc];
         sps->pic_conf_win.left_offset   = get_ue_golomb_long(gb) * horiz_mult;
@@ -951,8 +952,8 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
         return AVERROR_INVALIDDATA;
     }
 
-    sublayer_ordering_info = get_bits1(gb);
-    start = sublayer_ordering_info ? 0 : sps->max_sub_layers - 1;
+    sps->sublayer_ordering_info_flag = get_bits1(gb);
+    start = sps->sublayer_ordering_info_flag ? 0 : sps->max_sub_layers - 1;
     for (i = start; i < sps->max_sub_layers; i++) {
         sps->temporal_layer[i].max_dec_pic_buffering = get_ue_golomb_long(gb) + 1;
         sps->temporal_layer[i].num_reorder_pics      = get_ue_golomb_long(gb);
@@ -973,7 +974,7 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
         }
     }
 
-    if (!sublayer_ordering_info) {
+    if (!sps->sublayer_ordering_info_flag) {
         for (i = 0; i < start; i++) {
             sps->temporal_layer[i].max_dec_pic_buffering = sps->temporal_layer[start].max_dec_pic_buffering;
             sps->temporal_layer[i].num_reorder_pics      = sps->temporal_layer[start].num_reorder_pics;
@@ -1015,7 +1016,8 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
     if (sps->scaling_list_enable_flag) {
         set_default_scaling_list_data(&sps->scaling_list);
 
-        if (get_bits1(gb)) {
+        sps->scaling_list_data_present_flag = get_bits1(gb);
+        if (sps->scaling_list_data_present_flag) {
             ret = scaling_list_data(gb, avctx, &sps->scaling_list, sps);
             if (ret < 0)
                 return ret;
@@ -1071,8 +1073,8 @@ int ff_hevc_parse_sps(HEVCSPS *sps, GetBitContext *gb, unsigned int *sps_id,
     sps->sps_temporal_mvp_enabled_flag          = get_bits1(gb);
     sps->sps_strong_intra_smoothing_enable_flag = get_bits1(gb);
     sps->vui.common.sar = (AVRational){0, 1};
-    vui_present = get_bits1(gb);
-    if (vui_present)
+    sps->vui_present = get_bits1(gb);
+    if (sps->vui_present)
         decode_vui(gb, avctx, apply_defdispwin, sps);
 
     if (get_bits1(gb)) { // sps_extension_flag

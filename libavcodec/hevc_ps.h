@@ -184,6 +184,7 @@ typedef struct HEVCSPS {
 
     HEVCWindow output_window;
 
+    int conformance_window_flag;
     HEVCWindow pic_conf_win;
 
     HEVCHdrParams hdr;
@@ -196,6 +197,7 @@ typedef struct HEVCSPS {
     unsigned int log2_max_poc_lsb;
     int pcm_enabled_flag;
 
+    int sublayer_ordering_info_flag;
     int max_sub_layers;
     struct {
         int max_dec_pic_buffering;
@@ -204,10 +206,12 @@ typedef struct HEVCSPS {
     } temporal_layer[HEVC_MAX_SUB_LAYERS];
     uint8_t temporal_id_nesting_flag;
 
+    int vui_present;
     VUI vui;
     PTL ptl;
 
     uint8_t scaling_list_enable_flag;
+    int scaling_list_data_present_flag;
     ScalingList scaling_list;
 
     unsigned int nb_st_rps;
