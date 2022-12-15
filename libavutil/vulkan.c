@@ -233,7 +233,8 @@ int ff_vk_alloc_mem(FFVulkanContext *s, VkMemoryRequirements *req,
     return 0;
 }
 
-int ff_vk_create_buf(FFVulkanContext *s, FFVkBuffer *buf, size_t size, void *pNext,
+int ff_vk_create_buf(FFVulkanContext *s, FFVkBuffer *buf, size_t size,
+                     void *pNext, void *alloc_pNext,
                      VkBufferUsageFlags usage, VkMemoryPropertyFlagBits flags)
 {
     int err;
@@ -255,7 +256,7 @@ int ff_vk_create_buf(FFVulkanContext *s, FFVkBuffer *buf, size_t size, void *pNe
     };
     VkMemoryDedicatedAllocateInfo ded_alloc = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-        .pNext = NULL,
+        .pNext = alloc_pNext,
     };
     VkMemoryDedicatedRequirements ded_req = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
