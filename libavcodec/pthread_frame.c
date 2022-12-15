@@ -231,7 +231,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
         /* if the previous thread uses hwaccel then we take the lock to ensure
          * the threads don't run concurrently */
-        if (avctx->hwaccel) {
+        if (avctx->hwaccel && !(avctx->hwaccel->caps_internal & HWACCEL_CAP_THREAD_SAFE)) {
             pthread_mutex_lock(&p->parent->hwaccel_mutex);
             p->hwaccel_serializing = 1;
         }
