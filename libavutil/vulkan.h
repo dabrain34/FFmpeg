@@ -353,10 +353,6 @@ int ff_vk_alloc_mem(FFVulkanContext *s, VkMemoryRequirements *req,
 int ff_vk_create_buf(FFVulkanContext *s, FFVkBuffer *buf, size_t size,
                      void *pNext, void *alloc_pNext,
                      VkBufferUsageFlags usage, VkMemoryPropertyFlagBits flags);
-int ff_vk_image_create(FFVulkanContext *s, AVVkFrame *f, int idx,
-                       int width, int height, VkFormat fmt, VkImageTiling tiling,
-                       VkImageUsageFlagBits usage, VkImageCreateFlags flags,
-                       void *create_pnext, VkDeviceMemory *mem, void *alloc_pnext);
 
 /**
  * Buffer management code.
