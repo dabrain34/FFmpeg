@@ -1228,6 +1228,9 @@ static void av1_decode_flush(AVCodecContext *avctx)
     s->raw_seq = NULL;
 
     ff_cbs_flush(s->cbc);
+
+    if (avctx->hwaccel->flush)
+        avctx->hwaccel->flush(avctx);
 }
 
 #define OFFSET(x) offsetof(AV1DecContext, x)
