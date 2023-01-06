@@ -397,8 +397,8 @@ fail:
     return err;
 }
 
-int ff_vk_exec_get_query(FFVulkanContext *s, FFVkExecContext *e,
-                         void **data, int64_t *status)
+VkResult ff_vk_exec_get_query(FFVulkanContext *s, FFVkExecContext *e,
+                              void **data, int64_t *status)
 {
     VkResult ret;
     FFVulkanFunctions *vk = &s->vkfn;
@@ -411,7 +411,7 @@ int ff_vk_exec_get_query(FFVulkanContext *s, FFVkExecContext *e,
 
     qf |= pool->query_64bit ?
           VK_QUERY_RESULT_64_BIT : 0x0;
-    qf |= pool->query_results && pool->query_statuses ?
+    qf |= pool->query_statuses ?
           VK_QUERY_RESULT_WITH_STATUS_BIT_KHR : 0x0;
 
     ret = vk->GetQueryPoolResults(s->hwctx->act_dev, pool->query_pool,
@@ -419,11 +419,8 @@ int ff_vk_exec_get_query(FFVulkanContext *s, FFVkExecContext *e,
                                   pool->nb_queries,
                                   pool->qd_size, e->query_data,
                                   pool->query_64bit ? 8 : 4, qf);
-    if (ret != VK_SUCCESS) {
-        av_log(s, AV_LOG_ERROR, "Unable to perform query: %s!\n",
-               ff_vk_ret2str(ret));
-        return AVERROR_EXTERNAL;
-    }
+    if (ret != VK_SUCCESS)
+        return ret;
 
     if (pool->query_statuses && pool->query_64bit) {
         for (int i = 0; i < pool->query_statuses; i++) {
@@ -444,7 +441,7 @@ int ff_vk_exec_get_query(FFVulkanContext *s, FFVkExecContext *e,
     if (status)
         *status = res;
 
-    return 0;
+    return VK_SUCCESS;
 }
 
 FFVkExecContext *ff_vk_exec_get(FFVkExecPool *pool)

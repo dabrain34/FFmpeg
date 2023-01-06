@@ -307,9 +307,8 @@ FFVkExecContext *ff_vk_exec_get(FFVkExecPool *pool);
  * Performs nb_queries queries and returns their results and statuses.
  * Execution must have been waited on to produce valid results.
  */
-int ff_vk_exec_get_query(FFVulkanContext *s, FFVkExecContext *e,
-                         void **data, int64_t *status);
-
+VkResult ff_vk_exec_get_query(FFVulkanContext *s, FFVkExecContext *e,
+                              void **data, int64_t *status);
 
 /**
  * Start/submit/wait an execution.
