@@ -137,6 +137,7 @@ typedef struct H264Picture {
     int ref_count[2][2];    ///< number of entries in ref_poc         (FIXME need per slice)
     int mbaff;              ///< 1 -> MBAFF frame 0-> not MBAFF
     int field_picture;      ///< whether or not picture was encoded in separate fields
+    int picture_structure;  ///< picture structure
 
 /**
  * H264Picture.reference has this flag set,
