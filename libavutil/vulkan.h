@@ -30,11 +30,6 @@
 #include "hwcontext_vulkan.h"
 #include "vulkan_loader.h"
 
-#define FF_VK_DEFAULT_USAGE_FLAGS (VK_IMAGE_USAGE_SAMPLED_BIT      |           \
-                                   VK_IMAGE_USAGE_STORAGE_BIT      |           \
-                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT |           \
-                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT)
-
 /* GLSL management macros */
 #define INDENT(N) INDENT_##N
 #define INDENT_0
