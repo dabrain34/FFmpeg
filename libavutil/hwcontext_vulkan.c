@@ -62,6 +62,8 @@ typedef struct VulkanQueueCtx {
     VkFence fence;
     VkQueue queue;
     int was_synchronous;
+    int qf;
+    int qidx;
 
     /* Buffer dependencies */
     AVBufferRef **buf_deps;
@@ -115,6 +117,11 @@ typedef struct VulkanDevicePriv {
 } VulkanDevicePriv;
 
 typedef struct VulkanFramesPriv {
+    const VkFormat *fmts;
+    int nb_images;
+    VkImageAspectFlags aspect;
+    const struct FFVkFormatEntry *fmt;
+
     /* Image conversions */
     VulkanExecCtx conv_ctx;
 
@@ -144,110 +151,199 @@ typedef struct AVVkFrameInternal {
 #endif
 } AVVkFrameInternal;
 
-#define ADD_VAL_TO_LIST(list, count, val)                                      \
-    do {                                                                       \
-        list = av_realloc_array(list, sizeof(*list), ++count);                 \
-        if (!list) {                                                           \
-            err = AVERROR(ENOMEM);                                             \
-            goto fail;                                                         \
-        }                                                                      \
-        list[count - 1] = av_strdup(val);                                      \
-        if (!list[count - 1]) {                                                \
-            err = AVERROR(ENOMEM);                                             \
-            goto fail;                                                         \
-        }                                                                      \
-    } while(0)
+#define ASPECT_2PLANE (VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT)
+#define ASPECT_3PLANE (VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT | VK_IMAGE_ASPECT_PLANE_2_BIT)
 
-#define RELEASE_PROPS(props, count)                                            \
-    if (props) {                                                               \
-        for (int i = 0; i < count; i++)                                        \
-            av_free((void *)((props)[i]));                                     \
-        av_free((void *)props);                                                \
-    }
-
-static const struct {
+static const struct FFVkFormatEntry {
+    VkFormat vkf;
     enum AVPixelFormat pixfmt;
-    const VkFormat vkfmts[5];
-} vk_pixfmt_planar_map[] = {
-    { AV_PIX_FMT_GRAY8,   { VK_FORMAT_R8_UNORM } },
-    { AV_PIX_FMT_GRAY16,  { VK_FORMAT_R16_UNORM } },
-    { AV_PIX_FMT_GRAYF32, { VK_FORMAT_R32_SFLOAT } },
+    VkImageAspectFlags aspect;
+    int vk_planes;
+    int nb_images;
+    int nb_images_fallback;
+    const VkFormat fallback[5];
+} vk_formats_list[] = {
+    /* Gray formats */
+    { VK_FORMAT_R8_UNORM,   AV_PIX_FMT_GRAY8,   VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R8_UNORM   } },
+    { VK_FORMAT_R16_UNORM,  AV_PIX_FMT_GRAY16,  VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R16_UNORM  } },
+    { VK_FORMAT_R32_SFLOAT, AV_PIX_FMT_GRAYF32, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R32_SFLOAT } },
 
-    { AV_PIX_FMT_NV12, { VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM } },
-    { AV_PIX_FMT_NV21, { VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM } },
-    { AV_PIX_FMT_P010, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM } },
-    { AV_PIX_FMT_P012, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM } },
-    { AV_PIX_FMT_P016, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM } },
+    /* RGB formats */
+    { VK_FORMAT_R16G16B16A16_UNORM,       AV_PIX_FMT_XV36,    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R16G16B16A16_UNORM       } },
+    { VK_FORMAT_B8G8R8A8_UNORM,           AV_PIX_FMT_BGRA,    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_B8G8R8A8_UNORM           } },
+    { VK_FORMAT_R8G8B8A8_UNORM,           AV_PIX_FMT_RGBA,    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R8G8B8A8_UNORM           } },
+    { VK_FORMAT_R8G8B8_UNORM,             AV_PIX_FMT_RGB24,   VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R8G8B8_UNORM             } },
+    { VK_FORMAT_B8G8R8_UNORM,             AV_PIX_FMT_BGR24,   VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_B8G8R8_UNORM             } },
+    { VK_FORMAT_R16G16B16_UNORM,          AV_PIX_FMT_RGB48,   VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R16G16B16_UNORM          } },
+    { VK_FORMAT_R16G16B16A16_UNORM,       AV_PIX_FMT_RGBA64,  VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R16G16B16A16_UNORM       } },
+    { VK_FORMAT_R5G6B5_UNORM_PACK16,      AV_PIX_FMT_RGB565,  VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R5G6B5_UNORM_PACK16      } },
+    { VK_FORMAT_B5G6R5_UNORM_PACK16,      AV_PIX_FMT_BGR565,  VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_B5G6R5_UNORM_PACK16      } },
+    { VK_FORMAT_B8G8R8A8_UNORM,           AV_PIX_FMT_BGR0,    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_B8G8R8A8_UNORM           } },
+    { VK_FORMAT_R8G8B8A8_UNORM,           AV_PIX_FMT_RGB0,    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R8G8B8A8_UNORM           } },
+    { VK_FORMAT_A2R10G10B10_UNORM_PACK32, AV_PIX_FMT_X2RGB10, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_A2R10G10B10_UNORM_PACK32 } },
 
-    { AV_PIX_FMT_NV16, { VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM } },
+    /* Planar RGB */
+    { VK_FORMAT_R8_UNORM,   AV_PIX_FMT_GBRAP,    VK_IMAGE_ASPECT_COLOR_BIT, 1, 4, 4, { VK_FORMAT_R8_UNORM,   VK_FORMAT_R8_UNORM,   VK_FORMAT_R8_UNORM,   VK_FORMAT_R8_UNORM   } },
+    { VK_FORMAT_R16_UNORM,  AV_PIX_FMT_GBRAP16,  VK_IMAGE_ASPECT_COLOR_BIT, 1, 4, 4, { VK_FORMAT_R16_UNORM,  VK_FORMAT_R16_UNORM,  VK_FORMAT_R16_UNORM,  VK_FORMAT_R16_UNORM  } },
+    { VK_FORMAT_R32_SFLOAT, AV_PIX_FMT_GBRPF32,  VK_IMAGE_ASPECT_COLOR_BIT, 1, 3, 3, { VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT                       } },
+    { VK_FORMAT_R32_SFLOAT, AV_PIX_FMT_GBRAPF32, VK_IMAGE_ASPECT_COLOR_BIT, 1, 4, 4, { VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT } },
 
-    { AV_PIX_FMT_NV24, { VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM } },
-    { AV_PIX_FMT_NV42, { VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM } },
+    /* Two-plane 420 YUV at 8, 10, 12 and 16 bits */
+    { VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,                  AV_PIX_FMT_NV12, ASPECT_2PLANE, 2, 1, 2, { VK_FORMAT_R8_UNORM,  VK_FORMAT_R8G8_UNORM   } },
+    { VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16, AV_PIX_FMT_P010, ASPECT_2PLANE, 2, 1, 2, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM } },
+    { VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16, AV_PIX_FMT_P012, ASPECT_2PLANE, 2, 1, 2, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM } },
+    { VK_FORMAT_G16_B16R16_2PLANE_420_UNORM,               AV_PIX_FMT_P016, ASPECT_2PLANE, 2, 1, 2, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM } },
 
-    { AV_PIX_FMT_YUV420P,   {  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM } },
-    { AV_PIX_FMT_YUV420P10, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-    { AV_PIX_FMT_YUV420P12, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-    { AV_PIX_FMT_YUV420P16, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
+    /* Two-plane 422 YUV at 8, 10 and 16 bits */
+    { VK_FORMAT_G8_B8R8_2PLANE_422_UNORM,                  AV_PIX_FMT_NV16, ASPECT_2PLANE, 2, 1, 2, { VK_FORMAT_R8_UNORM,  VK_FORMAT_R8G8_UNORM   } },
+    { VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16, AV_PIX_FMT_P210, ASPECT_2PLANE, 2, 1, 2, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM } },
+    { VK_FORMAT_G16_B16R16_2PLANE_422_UNORM,               AV_PIX_FMT_P216, ASPECT_2PLANE, 2, 1, 2, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM } },
 
-    { AV_PIX_FMT_YUV422P,   {  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM } },
-    { AV_PIX_FMT_YUV422P10, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-    { AV_PIX_FMT_YUV422P12, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-    { AV_PIX_FMT_YUV422P16, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
+    /* Two-plane 444 YUV at 8, 10 and 16 bits */
+    { VK_FORMAT_G8_B8R8_2PLANE_444_UNORM,                  AV_PIX_FMT_NV24, ASPECT_2PLANE, 2, 1, 2, { VK_FORMAT_R8_UNORM,  VK_FORMAT_R8G8_UNORM   } },
+    { VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16, AV_PIX_FMT_P410, ASPECT_2PLANE, 2, 1, 2, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM } },
+    { VK_FORMAT_G16_B16R16_2PLANE_444_UNORM,               AV_PIX_FMT_P416, ASPECT_2PLANE, 2, 1, 2, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM } },
 
-    { AV_PIX_FMT_YUV444P,   {  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM } },
-    { AV_PIX_FMT_YUV444P10, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-    { AV_PIX_FMT_YUV444P12, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-    { AV_PIX_FMT_YUV444P16, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
+    /* Three-plane 420, 422, 444 at 8, 10, 12 and 16 bits */
+    { VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM,    AV_PIX_FMT_YUV420P,   ASPECT_3PLANE, 3, 1, 3, { VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM  } },
+    { VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM, AV_PIX_FMT_YUV420P10, ASPECT_3PLANE, 3, 1, 3, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
+    { VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM, AV_PIX_FMT_YUV420P12, ASPECT_3PLANE, 3, 1, 3, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
+    { VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM, AV_PIX_FMT_YUV420P16, ASPECT_3PLANE, 3, 1, 3, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
+    { VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM,    AV_PIX_FMT_YUV422P,   ASPECT_3PLANE, 3, 1, 3, { VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM  } },
+    { VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM, AV_PIX_FMT_YUV422P10, ASPECT_3PLANE, 3, 1, 3, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
+    { VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM, AV_PIX_FMT_YUV422P12, ASPECT_3PLANE, 3, 1, 3, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
+    { VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM, AV_PIX_FMT_YUV422P16, ASPECT_3PLANE, 3, 1, 3, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
+    { VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM,    AV_PIX_FMT_YUV444P,   ASPECT_3PLANE, 3, 1, 3, { VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM  } },
+    { VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM, AV_PIX_FMT_YUV444P10, ASPECT_3PLANE, 3, 1, 3, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
+    { VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM, AV_PIX_FMT_YUV444P12, ASPECT_3PLANE, 3, 1, 3, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
+    { VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM, AV_PIX_FMT_YUV444P16, ASPECT_3PLANE, 3, 1, 3, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
 
-    { AV_PIX_FMT_YUVA420P,   {  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM } },
-    { AV_PIX_FMT_YUVA420P10, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-    /* There is no AV_PIX_FMT_YUVA420P12 */
-    { AV_PIX_FMT_YUVA420P16, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-
-    { AV_PIX_FMT_YUVA422P,   {  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM } },
-    { AV_PIX_FMT_YUVA422P10, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-    { AV_PIX_FMT_YUVA422P12, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-    { AV_PIX_FMT_YUVA422P16, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-
-    { AV_PIX_FMT_YUVA444P,   {  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM,  VK_FORMAT_R8_UNORM } },
-    { AV_PIX_FMT_YUVA444P10, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-    { AV_PIX_FMT_YUVA444P12, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-    { AV_PIX_FMT_YUVA444P16, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-
-    { AV_PIX_FMT_VUYX,   { VK_FORMAT_R8G8B8A8_UNORM } },
-    { AV_PIX_FMT_XV36,   { VK_FORMAT_R16G16B16A16_UNORM } },
-
-    { AV_PIX_FMT_BGRA,   { VK_FORMAT_B8G8R8A8_UNORM } },
-    { AV_PIX_FMT_RGBA,   { VK_FORMAT_R8G8B8A8_UNORM } },
-    { AV_PIX_FMT_RGB24,  { VK_FORMAT_R8G8B8_UNORM } },
-    { AV_PIX_FMT_BGR24,  { VK_FORMAT_B8G8R8_UNORM } },
-    { AV_PIX_FMT_RGB48,  { VK_FORMAT_R16G16B16_UNORM } },
-    { AV_PIX_FMT_RGBA64, { VK_FORMAT_R16G16B16A16_UNORM } },
-    { AV_PIX_FMT_RGBA64, { VK_FORMAT_R16G16B16A16_UNORM } },
-    { AV_PIX_FMT_RGB565, { VK_FORMAT_R5G6B5_UNORM_PACK16 } },
-    { AV_PIX_FMT_BGR565, { VK_FORMAT_B5G6R5_UNORM_PACK16 } },
-    { AV_PIX_FMT_BGR0,   { VK_FORMAT_B8G8R8A8_UNORM } },
-    { AV_PIX_FMT_RGB0,   { VK_FORMAT_R8G8B8A8_UNORM } },
-
-    /* Lower priority as there's an endianess-dependent overlap between these
-     * and rgba/bgr0, and PACK32 formats are more limited */
-    { AV_PIX_FMT_BGR32,  { VK_FORMAT_A8B8G8R8_UNORM_PACK32 } },
-    { AV_PIX_FMT_0BGR32, { VK_FORMAT_A8B8G8R8_UNORM_PACK32 } },
-
-    { AV_PIX_FMT_X2RGB10, { VK_FORMAT_A2R10G10B10_UNORM_PACK32 } },
-
-    { AV_PIX_FMT_GBRAP, { VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM } },
-    { AV_PIX_FMT_GBRAP16, { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM, VK_FORMAT_R16_UNORM } },
-    { AV_PIX_FMT_GBRPF32, { VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT } },
-    { AV_PIX_FMT_GBRAPF32, { VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32_SFLOAT } },
+    /* Single plane 422 at 8, 10 and 12 bits */
+    { VK_FORMAT_G8B8G8R8_422_UNORM,                     AV_PIX_FMT_YUYV422, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R8G8B8A8_UNORM     } },
+    { VK_FORMAT_B8G8R8G8_422_UNORM,                     AV_PIX_FMT_UYVY422, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R8G8B8A8_UNORM     } },
+    { VK_FORMAT_G10X6B10X6G10X6R10X6_422_UNORM_4PACK16, AV_PIX_FMT_Y210,    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R16G16B16A16_UNORM } },
+    { VK_FORMAT_G12X4B12X4G12X4R12X4_422_UNORM_4PACK16, AV_PIX_FMT_Y212,    VK_IMAGE_ASPECT_COLOR_BIT, 1, 1, 1, { VK_FORMAT_R16G16B16A16_UNORM } },
 };
+static const int nb_vk_formats_list = FF_ARRAY_ELEMS(vk_formats_list);
 
 const VkFormat *av_vkfmt_from_pixfmt(enum AVPixelFormat p)
 {
-    for (enum AVPixelFormat i = 0; i < FF_ARRAY_ELEMS(vk_pixfmt_planar_map); i++)
-        if (vk_pixfmt_planar_map[i].pixfmt == p)
-            return vk_pixfmt_planar_map[i].vkfmts;
+    for (int i = 0; i < nb_vk_formats_list; i++)
+        if (vk_formats_list[i].pixfmt == p)
+            return vk_formats_list[i].fallback;
     return NULL;
+}
+
+static const struct FFVkFormatEntry *vk_find_format_entry(enum AVPixelFormat p)
+{
+    for (int i = 0; i < nb_vk_formats_list; i++)
+        if (vk_formats_list[i].pixfmt == p)
+            return &vk_formats_list[i];
+    return NULL;
+}
+
+/* Malitia pura, Khronos */
+#define FN_MAP_TO(dst_t, dst, src_t, src)                                     \
+    static dst_t map_ ##src## _to_ ##dst(src_t mask2)                         \
+    {                                                                         \
+        dst_t mask1 = 0x0;                                                    \
+        MAP_TO(mask1, mask2, VK_FORMAT_FEATURE_2_VIDEO_DECODE_OUTPUT_BIT_KHR, \
+                             VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR);        \
+        MAP_TO(mask1, mask2, VK_FORMAT_FEATURE_2_VIDEO_DECODE_DPB_BIT_KHR,    \
+                             VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR);        \
+        MAP_TO(mask1, mask2, VK_FORMAT_FEATURE_2_VIDEO_ENCODE_DPB_BIT_KHR,    \
+                             VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR);        \
+        MAP_TO(mask1, mask2, VK_FORMAT_FEATURE_2_VIDEO_ENCODE_INPUT_BIT_KHR,  \
+                             VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR);        \
+        return mask1;                                                         \
+    }
+
+#define MAP_TO(mask1, mask2, flag1, flag2) if (mask2 & flag2) mask1 |= flag1;
+FN_MAP_TO(VkFormatFeatureFlagBits2, feats, VkImageUsageFlags, usage)
+#undef MAP_TO
+#define MAP_TO(mask1, mask2, flag1, flag2) if (mask1 & flag1) mask2 |= flag2;
+FN_MAP_TO(VkImageUsageFlags, usage, VkFormatFeatureFlagBits2, feats)
+#undef MAP_TO
+#undef FN_MAP_TO
+
+int av_vkfmt_from_pixfmt2(AVHWDeviceContext *dev_ctx, enum AVPixelFormat p,
+                          VkImageUsageFlags additional_usage, const VkFormat **fmts,
+                          int *nb_images, VkImageAspectFlags *aspect,
+                          VkImageUsageFlags *supported_usage)
+{
+    AVVulkanDeviceContext *hwctx = dev_ctx->hwctx;
+    VulkanDevicePriv *priv = dev_ctx->internal->priv;
+    FFVulkanFunctions *vk = &priv->vkfn;
+
+    VkFormatProperties2 prop = {
+        .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+    };
+    const VkFormatFeatureFlagBits2 basic_flags = VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+                                                 VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT  |
+                                                 VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+    const VkFormatFeatureFlagBits2 full_flags = VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+                                                basic_flags;
+
+    const VkFormatFeatureFlagBits2 additional_flags = map_usage_to_feats(additional_usage);
+
+    for (int i = 0; i < nb_vk_formats_list; i++) {
+        if (vk_formats_list[i].pixfmt == p) {
+            VkFormatFeatureFlagBits *feat = &prop.formatProperties.optimalTilingFeatures;
+            VkFormatFeatureFlagBits2 feats_vk1, feats_vk2;
+            int basics;
+            int full;
+            int additional;
+
+            basics = 0;
+            full = 0;
+            additional = 0;
+            vk->GetPhysicalDeviceFormatProperties2(hwctx->phys_dev, vk_formats_list[i].vkf,
+                                                   &prop);
+
+            /* We want at least the basics supported */
+            feats_vk1 = *feat;
+            basics = !!(*feat & basic_flags);
+            additional = !!(*feat & additional_flags);
+
+            /* If basics are not supported, OR we have multiplane images,
+             * check the fallback/single-plane rep for support. */
+            if (!basics || vk_formats_list[i].vk_planes > 1)
+                vk->GetPhysicalDeviceFormatProperties2(hwctx->phys_dev,
+                                                       vk_formats_list[i].fallback[0],
+                                                       &prop);
+
+            feats_vk2 = *feat;
+            full = !!(*feat & full_flags);
+
+            if (additional_flags && !additional) {
+                return AVERROR(ENOTSUP);
+            } else if (full && basics) {
+                if (fmts)
+                    *fmts = &vk_formats_list[i].vkf;
+                if (nb_images)
+                    *nb_images = 1;
+                if (aspect)
+                    *aspect = vk_formats_list[i].aspect;
+                if (supported_usage)
+                    *supported_usage = map_feats_to_usage(feats_vk1);
+                return 0;
+            } else if (full && (vk_formats_list[i].vk_planes > 1)) {
+                if (fmts)
+                    *fmts = vk_formats_list[i].fallback;
+                if (nb_images)
+                    *nb_images = vk_formats_list[i].nb_images_fallback;
+                if (aspect)
+                    *aspect = vk_formats_list[i].aspect;
+                if (supported_usage)
+                    *supported_usage = map_feats_to_usage(feats_vk2);
+                return 0;
+            } else {
+                return AVERROR(ENOTSUP);
+            }
+        }
+    }
+
+    return AVERROR(EINVAL);
 }
 
 static const void *vk_find_struct(const void *chain, VkStructureType stype)
@@ -273,33 +369,6 @@ static void vk_link_struct(void *chain, void *in)
         out = out->pNext;
 
     out->pNext = in;
-}
-
-static int pixfmt_is_supported(AVHWDeviceContext *dev_ctx, enum AVPixelFormat p,
-                               int linear)
-{
-    AVVulkanDeviceContext *hwctx = dev_ctx->hwctx;
-    VulkanDevicePriv *priv = dev_ctx->internal->priv;
-    FFVulkanFunctions *vk = &priv->vkfn;
-    const VkFormat *fmt = av_vkfmt_from_pixfmt(p);
-    int planes = av_pix_fmt_count_planes(p);
-
-    if (!fmt)
-        return 0;
-
-    for (int i = 0; i < planes; i++) {
-        VkFormatFeatureFlags flags;
-        VkFormatProperties2 prop = {
-            .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
-        };
-        vk->GetPhysicalDeviceFormatProperties2(hwctx->phys_dev, fmt[i], &prop);
-        flags = linear ? prop.formatProperties.linearTilingFeatures :
-                         prop.formatProperties.optimalTilingFeatures;
-        if (!(flags & FF_VK_DEFAULT_USAGE_FLAGS))
-            return 0;
-    }
-
-    return 1;
 }
 
 static int load_libvulkan(AVHWDeviceContext *ctx)
@@ -439,6 +508,27 @@ static VkBool32 vk_dbg_callback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
 
     return 0;
 }
+
+#define ADD_VAL_TO_LIST(list, count, val)                                      \
+    do {                                                                       \
+        list = av_realloc_array(list, sizeof(*list), ++count);                 \
+        if (!list) {                                                           \
+            err = AVERROR(ENOMEM);                                             \
+            goto fail;                                                         \
+        }                                                                      \
+        list[count - 1] = av_strdup(val);                                      \
+        if (!list[count - 1]) {                                                \
+            err = AVERROR(ENOMEM);                                             \
+            goto fail;                                                         \
+        }                                                                      \
+    } while(0)
+
+#define RELEASE_PROPS(props, count)                                            \
+    if (props) {                                                               \
+        for (int i = 0; i < count; i++)                                        \
+            av_free((void *)((props)[i]));                                     \
+        av_free((void *)props);                                                \
+    }
 
 static int check_extensions(AVHWDeviceContext *ctx, int dev, AVDictionary *opts,
                             const char * const **dst, uint32_t *num, int debug)
@@ -688,6 +778,10 @@ static int create_instance(AVHWDeviceContext *ctx, AVDictionary *opts)
     AVVulkanDeviceContext *hwctx = ctx->hwctx;
     VkApplicationInfo application_info = {
         .sType              = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .pApplicationName   = "ffmpeg",
+        .applicationVersion = VK_MAKE_VERSION(LIBAVUTIL_VERSION_MAJOR,
+                                              LIBAVUTIL_VERSION_MINOR,
+                                              LIBAVUTIL_VERSION_MICRO),
         .pEngineName        = "libavutil",
         .apiVersion         = VK_API_VERSION_1_3,
         .engineVersion      = VK_MAKE_VERSION(LIBAVUTIL_VERSION_MAJOR,
@@ -1126,6 +1220,8 @@ static int create_exec_ctx(AVHWFramesContext *hwfc, VulkanExecCtx *cmd,
         VulkanQueueCtx *q = &cmd->queues[i];
         vk->GetDeviceQueue(hwctx->act_dev, queue_family_index, i, &q->queue);
         q->was_synchronous = 1;
+        q->qf = queue_family_index;
+        q->qidx = i;
     }
 
     return 0;
@@ -1261,6 +1357,7 @@ static int submit_exec_ctx(AVHWFramesContext *hwfc, VulkanExecCtx *cmd,
     VkResult ret;
     VulkanQueueCtx *q = &cmd->queues[cmd->cur_queue_idx];
     VulkanDevicePriv *p = hwfc->device_ctx->internal->priv;
+    AVVulkanDeviceContext *hwctx = hwfc->device_ctx->hwctx;
     FFVulkanFunctions *vk = &p->vkfn;
 
     ret = vk->EndCommandBuffer(cmd->bufs[cmd->cur_queue_idx]);
@@ -1274,7 +1371,9 @@ static int submit_exec_ctx(AVHWFramesContext *hwfc, VulkanExecCtx *cmd,
     s_info->pCommandBuffers = &cmd->bufs[cmd->cur_queue_idx];
     s_info->commandBufferCount = 1;
 
+    hwctx->lock_queue(hwfc->device_ctx, q->qf, q->qidx);
     ret = vk->QueueSubmit(q->queue, 1, s_info, q->fence);
+    hwctx->unlock_queue(hwfc->device_ctx, q->qf, q->qidx);
     if (ret != VK_SUCCESS) {
         av_log(hwfc, AV_LOG_ERROR, "Queue submission failure: %s\n",
                vk_ret2str(ret));
@@ -1289,7 +1388,6 @@ static int submit_exec_ctx(AVHWFramesContext *hwfc, VulkanExecCtx *cmd,
     q->was_synchronous = synchronous;
 
     if (synchronous) {
-        AVVulkanDeviceContext *hwctx = hwfc->device_ctx->hwctx;
         vk->WaitForFences(hwctx->act_dev, 1, &q->fence, VK_TRUE, UINT64_MAX);
         vk->ResetFences(hwctx->act_dev, 1, &q->fence);
         unref_exec_ctx_deps(hwfc, cmd);
@@ -1442,12 +1540,6 @@ static int vulkan_device_create_internal(AVHWDeviceContext *ctx,
     opt_d = av_dict_get(opts, "linear_images", NULL, 0);
     if (opt_d)
         p->use_linear_images = strtol(opt_d->value, NULL, 10);
-
-    opt_d = av_dict_get(opts, "contiguous_planes", NULL, 0);
-    if (opt_d)
-        p->contiguous_planes = strtol(opt_d->value, NULL, 10);
-    else
-        p->contiguous_planes = -1;
 
     hwctx->enabled_dev_extensions = dev_info.ppEnabledExtensionNames;
     hwctx->nb_enabled_dev_extensions = dev_info.enabledExtensionCount;
@@ -1685,8 +1777,10 @@ static int vulkan_frames_get_constraints(AVHWDeviceContext *ctx,
     int count = 0;
     VulkanDevicePriv *p = ctx->internal->priv;
 
-    for (enum AVPixelFormat i = 0; i < AV_PIX_FMT_NB; i++)
-        count += pixfmt_is_supported(ctx, i, p->use_linear_images);
+    for (enum AVPixelFormat i = 0; i < nb_vk_formats_list; i++) {
+        count += av_vkfmt_from_pixfmt2(ctx, vk_formats_list[i].pixfmt,
+                                       0, NULL, NULL, NULL, NULL) >= 0;
+    }
 
 #if CONFIG_CUDA
     if (p->dev_is_nvidia)
@@ -1699,9 +1793,12 @@ static int vulkan_frames_get_constraints(AVHWDeviceContext *ctx,
         return AVERROR(ENOMEM);
 
     count = 0;
-    for (enum AVPixelFormat i = 0; i < AV_PIX_FMT_NB; i++)
-        if (pixfmt_is_supported(ctx, i, p->use_linear_images))
-            constraints->valid_sw_formats[count++] = i;
+    for (enum AVPixelFormat i = 0; i < nb_vk_formats_list; i++) {
+        if (av_vkfmt_from_pixfmt2(ctx, vk_formats_list[i].pixfmt,
+                                  0, NULL, NULL, NULL, NULL) >= 0) {
+            constraints->valid_sw_formats[count++] = vk_formats_list[i].pixfmt;
+        }
+    }
 
 #if CONFIG_CUDA
     if (p->dev_is_nvidia)
@@ -1709,8 +1806,8 @@ static int vulkan_frames_get_constraints(AVHWDeviceContext *ctx,
 #endif
     constraints->valid_sw_formats[count++] = AV_PIX_FMT_NONE;
 
-    constraints->min_width  = 0;
-    constraints->min_height = 0;
+    constraints->min_width  = 1;
+    constraints->min_height = 1;
     constraints->max_width  = p->props.properties.limits.maxImageDimension2D;
     constraints->max_height = p->props.properties.limits.maxImageDimension2D;
 
@@ -1784,7 +1881,7 @@ static int alloc_mem(AVHWDeviceContext *ctx, VkMemoryRequirements *req,
 
 static void vulkan_free_internal(AVVkFrame *f)
 {
-    AVVkFrameInternal *internal = f->internal;
+    av_unused AVVkFrameInternal *internal = f->internal;
 
 #if CONFIG_CUDA
     if (internal->cuda_fc_ref) {
@@ -1824,17 +1921,22 @@ static void vulkan_frame_free(void *opaque, uint8_t *data)
     AVVulkanDeviceContext *hwctx = hwfc->device_ctx->hwctx;
     VulkanDevicePriv *p = hwfc->device_ctx->internal->priv;
     FFVulkanFunctions *vk = &p->vkfn;
-    int planes = av_pix_fmt_count_planes(hwfc->sw_format);
+    int nb_images = ff_vk_count_images(f);
 
-    /* We could use vkWaitSemaphores, but the validation layer seems to have
-     * issues tracking command buffer execution state on uninit. */
-    vk->DeviceWaitIdle(hwctx->act_dev);
+    VkSemaphoreWaitInfo sem_wait = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+        .pSemaphores = f->sem,
+        .pValues = f->sem_value,
+        .semaphoreCount = nb_images,
+    };
+
+    vk->WaitSemaphores(hwctx->act_dev, &sem_wait, UINT64_MAX);
 
     vulkan_free_internal(f);
 
-    for (int i = 0; i < planes; i++) {
-        vk->DestroyImage(hwctx->act_dev, f->img[i], hwctx->alloc);
-        vk->FreeMemory(hwctx->act_dev, f->mem[i], hwctx->alloc);
+    for (int i = 0; i < nb_images; i++) {
+        vk->DestroyImage(hwctx->act_dev,     f->img[i], hwctx->alloc);
+        vk->FreeMemory(hwctx->act_dev,       f->mem[i], hwctx->alloc);
         vk->DestroySemaphore(hwctx->act_dev, f->sem[i], hwctx->alloc);
     }
 
@@ -1844,30 +1946,25 @@ static void vulkan_frame_free(void *opaque, uint8_t *data)
 static int alloc_bind_mem(AVHWFramesContext *hwfc, AVVkFrame *f,
                           void *alloc_pnext, size_t alloc_pnext_stride)
 {
-    int err;
+    int img_cnt = 0, err;
     VkResult ret;
     AVHWDeviceContext *ctx = hwfc->device_ctx;
     VulkanDevicePriv *p = ctx->internal->priv;
     FFVulkanFunctions *vk = &p->vkfn;
     AVVulkanFramesContext *hwfctx = hwfc->hwctx;
-    const int planes = av_pix_fmt_count_planes(hwfc->sw_format);
     VkBindImageMemoryInfo bind_info[AV_NUM_DATA_POINTERS] = { { 0 } };
-
-    VkMemoryRequirements cont_memory_requirements = { 0 };
-    int cont_mem_size_list[AV_NUM_DATA_POINTERS] = { 0 };
-    int cont_mem_size = 0;
 
     AVVulkanDeviceContext *hwctx = ctx->hwctx;
 
-    for (int i = 0; i < planes; i++) {
+    while (f->img[img_cnt]) {
         int use_ded_mem;
         VkImageMemoryRequirementsInfo2 req_desc = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
-            .image = f->img[i],
+            .image = f->img[img_cnt],
         };
         VkMemoryDedicatedAllocateInfo ded_alloc = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-            .pNext = (void *)(((uint8_t *)alloc_pnext) + i*alloc_pnext_stride),
+            .pNext = (void *)(((uint8_t *)alloc_pnext) + img_cnt*alloc_pnext_stride),
         };
         VkMemoryDedicatedRequirements ded_req = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
@@ -1879,79 +1976,35 @@ static int alloc_bind_mem(AVHWFramesContext *hwfc, AVVkFrame *f,
 
         vk->GetImageMemoryRequirements2(hwctx->act_dev, &req_desc, &req);
 
-        if (f->tiling == VK_IMAGE_TILING_LINEAR)
+        if (hwfctx->tiling == VK_IMAGE_TILING_LINEAR)
             req.memoryRequirements.size = FFALIGN(req.memoryRequirements.size,
                                                   p->props.properties.limits.minMemoryMapAlignment);
-
-        if (hwfctx->flags & AV_VK_FRAME_FLAG_CONTIGUOUS_MEMORY) {
-            if (ded_req.requiresDedicatedAllocation) {
-                av_log(hwfc, AV_LOG_ERROR, "Cannot allocate all planes in a single allocation, "
-                                           "device requires dedicated image allocation!\n");
-                return AVERROR(EINVAL);
-            } else if (!i) {
-                cont_memory_requirements = req.memoryRequirements;
-            } else if (cont_memory_requirements.memoryTypeBits !=
-                       req.memoryRequirements.memoryTypeBits) {
-                av_log(hwfc, AV_LOG_ERROR, "The memory requirements differ between plane 0 "
-                                           "and %i, cannot allocate in a single region!\n",
-                                           i);
-                return AVERROR(EINVAL);
-            }
-
-            cont_mem_size_list[i] = FFALIGN(req.memoryRequirements.size,
-                                            req.memoryRequirements.alignment);
-            cont_mem_size += cont_mem_size_list[i];
-            continue;
-        }
 
         /* In case the implementation prefers/requires dedicated allocation */
         use_ded_mem = ded_req.prefersDedicatedAllocation |
                       ded_req.requiresDedicatedAllocation;
         if (use_ded_mem)
-            ded_alloc.image = f->img[i];
+            ded_alloc.image = f->img[img_cnt];
 
         /* Allocate memory */
         if ((err = alloc_mem(ctx, &req.memoryRequirements,
-                             f->tiling == VK_IMAGE_TILING_LINEAR ?
+                             hwfctx->tiling == VK_IMAGE_TILING_LINEAR ?
                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT :
                              VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                              use_ded_mem ? &ded_alloc : (void *)ded_alloc.pNext,
-                             &f->flags, &f->mem[i])))
+                             &f->flags, &f->mem[img_cnt])))
             return err;
 
-        f->size[i] = req.memoryRequirements.size;
-        bind_info[i].sType  = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
-        bind_info[i].image  = f->img[i];
-        bind_info[i].memory = f->mem[i];
-    }
+        f->size[img_cnt] = req.memoryRequirements.size;
+        bind_info[img_cnt].sType  = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
+        bind_info[img_cnt].image  = f->img[img_cnt];
+        bind_info[img_cnt].memory = f->mem[img_cnt];
 
-    if (hwfctx->flags & AV_VK_FRAME_FLAG_CONTIGUOUS_MEMORY) {
-        cont_memory_requirements.size = cont_mem_size;
-
-        /* Allocate memory */
-        if ((err = alloc_mem(ctx, &cont_memory_requirements,
-                                f->tiling == VK_IMAGE_TILING_LINEAR ?
-                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT :
-                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                                (void *)(((uint8_t *)alloc_pnext)),
-                                &f->flags, &f->mem[0])))
-            return err;
-
-        f->size[0] = cont_memory_requirements.size;
-
-        for (int i = 0, offset = 0; i < planes; i++) {
-            bind_info[i].sType        = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO;
-            bind_info[i].image        = f->img[i];
-            bind_info[i].memory       = f->mem[0];
-            bind_info[i].memoryOffset = offset;
-
-            f->offset[i] = bind_info[i].memoryOffset;
-            offset += cont_mem_size_list[i];
-        }
+        img_cnt++;
     }
 
     /* Bind the allocated memory to the images */
-    ret = vk->BindImageMemory2(hwctx->act_dev, planes, bind_info);
+    ret = vk->BindImageMemory2(hwctx->act_dev, img_cnt, bind_info);
     if (ret != VK_SUCCESS) {
         av_log(ctx, AV_LOG_ERROR, "Failed to bind memory: %s\n",
                vk_ret2str(ret));
@@ -1978,11 +2031,10 @@ static int prepare_frame(AVHWFramesContext *hwfc, VulkanExecCtx *ectx,
     VkImageLayout new_layout;
     VkAccessFlags2 new_access;
     AVVulkanFramesContext *vkfc = hwfc->hwctx;
-    const int planes = av_pix_fmt_count_planes(hwfc->sw_format);
     VulkanDevicePriv *p = hwfc->device_ctx->internal->priv;
     FFVulkanFunctions *vk = &p->vkfn;
-    AVFrame tmp = { .data[0] = (uint8_t *)frame };
     uint64_t sem_sig_val[AV_NUM_DATA_POINTERS];
+    int nb_images = ff_vk_count_images(frame);
 
     VkImageMemoryBarrier2 img_bar[AV_NUM_DATA_POINTERS] = { 0 };
     VkDependencyInfo dep_info;
@@ -1990,14 +2042,14 @@ static int prepare_frame(AVHWFramesContext *hwfc, VulkanExecCtx *ectx,
     VkTimelineSemaphoreSubmitInfo s_timeline_sem_info = {
         .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
         .pSignalSemaphoreValues = sem_sig_val,
-        .signalSemaphoreValueCount = planes,
+        .signalSemaphoreValueCount = nb_images,
     };
 
     VkSubmitInfo s_info = {
         .sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .pNext                = &s_timeline_sem_info,
         .pSignalSemaphores    = frame->sem,
-        .signalSemaphoreCount = planes,
+        .signalSemaphoreCount = nb_images,
     };
 
     VkPipelineStageFlagBits wait_st[AV_NUM_DATA_POINTERS];
@@ -2007,7 +2059,7 @@ static int prepare_frame(AVHWFramesContext *hwfc, VulkanExecCtx *ectx,
 
     vkfc->lock_frame(hwfc, frame);
 
-    for (int i = 0; i < planes; i++) {
+    for (int i = 0; i < nb_images; i++) {
         wait_st[i] = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         sem_sig_val[i] = frame->sem_value[i] + 1;
     }
@@ -2025,10 +2077,10 @@ static int prepare_frame(AVHWFramesContext *hwfc, VulkanExecCtx *ectx,
         src_qf     = VK_QUEUE_FAMILY_EXTERNAL_KHR;
         dst_qf     = VK_QUEUE_FAMILY_IGNORED;
         s_timeline_sem_info.pWaitSemaphoreValues = frame->sem_value;
-        s_timeline_sem_info.waitSemaphoreValueCount = planes;
+        s_timeline_sem_info.waitSemaphoreValueCount = nb_images;
         s_info.pWaitSemaphores = frame->sem;
         s_info.pWaitDstStageMask = wait_st;
-        s_info.waitSemaphoreCount = planes;
+        s_info.waitSemaphoreCount = nb_images;
         break;
     case PREP_MODE_EXTERNAL_EXPORT:
         new_layout = VK_IMAGE_LAYOUT_GENERAL;
@@ -2036,10 +2088,10 @@ static int prepare_frame(AVHWFramesContext *hwfc, VulkanExecCtx *ectx,
         src_qf     = VK_QUEUE_FAMILY_IGNORED;
         dst_qf     = VK_QUEUE_FAMILY_EXTERNAL_KHR;
         s_timeline_sem_info.pWaitSemaphoreValues = frame->sem_value;
-        s_timeline_sem_info.waitSemaphoreValueCount = planes;
+        s_timeline_sem_info.waitSemaphoreValueCount = nb_images;
         s_info.pWaitSemaphores = frame->sem;
         s_info.pWaitDstStageMask = wait_st;
-        s_info.waitSemaphoreCount = planes;
+        s_info.waitSemaphoreCount = nb_images;
         break;
     case PREP_MODE_DECODING_DST:
         new_layout = VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR;
@@ -2064,7 +2116,7 @@ static int prepare_frame(AVHWFramesContext *hwfc, VulkanExecCtx *ectx,
     /* Change the image layout to something more optimal for writes.
      * This also signals the newly created semaphore, making it usable
      * for synchronization */
-    for (int i = 0; i < planes; i++) {
+    for (int i = 0; i < nb_images; i++) {
         img_bar[i] = (VkImageMemoryBarrier2) {
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
             .pNext = NULL,
@@ -2079,8 +2131,8 @@ static int prepare_frame(AVHWFramesContext *hwfc, VulkanExecCtx *ectx,
             .image = frame->img[i],
             .subresourceRange = (VkImageSubresourceRange) {
                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .layerCount = VK_REMAINING_ARRAY_LAYERS,
                 .levelCount = 1,
-                .layerCount = 1,
             },
         };
 
@@ -2092,7 +2144,7 @@ static int prepare_frame(AVHWFramesContext *hwfc, VulkanExecCtx *ectx,
         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
         .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
         .pImageMemoryBarriers = img_bar,
-        .imageMemoryBarrierCount = planes,
+        .imageMemoryBarrierCount = nb_images,
     };
 
     vk->CmdPipelineBarrier2KHR(get_buf_exec_ctx(hwfc, ectx), &dep_info);
@@ -2103,7 +2155,7 @@ static int prepare_frame(AVHWFramesContext *hwfc, VulkanExecCtx *ectx,
     return err;
 }
 
-static inline void get_plane_wh(int *w, int *h, enum AVPixelFormat format,
+static inline void get_plane_wh(uint32_t *w, uint32_t *h, enum AVPixelFormat format,
                                 int frame_w, int frame_h, int plane)
 {
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(format);
@@ -2122,17 +2174,17 @@ static inline void get_plane_wh(int *w, int *h, enum AVPixelFormat format,
 
 static int create_frame(AVHWFramesContext *hwfc, AVVkFrame **frame,
                         VkImageTiling tiling, VkImageUsageFlagBits usage,
+                        VkImageCreateFlags flags, int nb_layers,
                         void *create_pnext)
 {
     int err;
     VkResult ret;
     AVHWDeviceContext *ctx = hwfc->device_ctx;
     VulkanDevicePriv *p = ctx->internal->priv;
+    VulkanFramesPriv *fp = hwfc->internal->priv;
     FFVulkanFunctions *vk = &p->vkfn;
     AVVulkanDeviceContext *hwctx = ctx->hwctx;
-    enum AVPixelFormat format = hwfc->sw_format;
-    const VkFormat *img_fmts = av_vkfmt_from_pixfmt(format);
-    const int planes = av_pix_fmt_count_planes(format);
+    AVVulkanFramesContext *frames = hwfc->hwctx;
 
     VkExportSemaphoreCreateInfo ext_sem_info = {
         .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
@@ -2167,17 +2219,19 @@ static int create_frame(AVHWFramesContext *hwfc, AVVkFrame **frame,
         return AVERROR(ENOMEM);
     }
 
+    // TODO: check witdh and height for alignment in case of multiplanar (must be mod-2 if subsampled)
+
     /* Create the images */
-    for (int i = 0; i < planes; i++) {
+    for (int i = 0; i < fp->nb_images; i++) {
         VkImageCreateInfo create_info = {
             .sType                 = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext                 = create_pnext,
             .imageType             = VK_IMAGE_TYPE_2D,
-            .format                = img_fmts[i],
+            .format                = fp->fmts[i],
             .extent.depth          = 1,
             .mipLevels             = 1,
-            .arrayLayers           = 1,
-            .flags                 = VK_IMAGE_CREATE_ALIAS_BIT,
+            .arrayLayers           = nb_layers,
+            .flags                 = flags,
             .tiling                = tiling,
             .initialLayout         = VK_IMAGE_LAYOUT_UNDEFINED,
             .usage                 = usage,
@@ -2189,7 +2243,7 @@ static int create_frame(AVHWFramesContext *hwfc, AVVkFrame **frame,
         };
 
         get_plane_wh(&create_info.extent.width, &create_info.extent.height,
-                     format, hwfc->width, hwfc->height, i);
+                     hwfc->sw_format, hwfc->width, hwfc->height, i);
 
         ret = vk->CreateImage(hwctx->act_dev, &create_info,
                               hwctx->alloc, &f->img[i]);
@@ -2298,13 +2352,7 @@ static AVBufferRef *vulkan_pool_alloc(void *opaque, size_t size)
     AVVulkanFramesContext *hwctx = hwfc->hwctx;
     VulkanDevicePriv *p = hwfc->device_ctx->internal->priv;
     VulkanFramesPriv *fp = hwfc->internal->priv;
-    VkExportMemoryAllocateInfo eminfo[AV_NUM_DATA_POINTERS];
     VkExternalMemoryHandleTypeFlags e = 0x0;
-
-    VkExternalMemoryImageCreateInfo eiinfo = {
-        .sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-        .pNext       = hwctx->create_pnext,
-    };
 
 #ifdef _WIN32
     if (p->extensions & FF_VK_EXT_EXTERNAL_WIN32_MEMORY)
@@ -2312,27 +2360,15 @@ static AVBufferRef *vulkan_pool_alloc(void *opaque, size_t size)
                              ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
                              : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT);
 #else
-    if (p->extensions & FF_VK_EXT_EXTERNAL_FD_MEMORY)
-        try_export_flags(hwfc, &eiinfo.handleTypes, &e,
-                         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
 
-    if (p->extensions & (FF_VK_EXT_EXTERNAL_DMABUF_MEMORY | FF_VK_EXT_DRM_MODIFIER_FLAGS))
-        try_export_flags(hwfc, &eiinfo.handleTypes, &e,
-                         VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
 #endif
 
-    for (int i = 0; i < av_pix_fmt_count_planes(hwfc->sw_format); i++) {
-        eminfo[i].sType       = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
-        eminfo[i].pNext       = hwctx->alloc_pnext[i];
-        eminfo[i].handleTypes = e;
-    }
-
-    err = create_frame(hwfc, &f, hwctx->tiling, hwctx->usage,
-                       eiinfo.handleTypes ? &eiinfo : NULL);
+    err = create_frame(hwfc, &f, hwctx->tiling, hwctx->usage, hwctx->img_flags,
+                       hwctx->nb_layers, hwctx->create_pnext);
     if (err)
         return NULL;
 
-    err = alloc_bind_mem(hwfc, f, eminfo, sizeof(*eminfo));
+    err = alloc_bind_mem(hwfc, f, NULL, 0);
     if (err)
         goto fail;
 
@@ -2393,103 +2429,44 @@ static int vulkan_frames_init(AVHWFramesContext *hwfc)
     VulkanFramesPriv *fp = hwfc->internal->priv;
     AVVulkanDeviceContext *dev_hwctx = hwfc->device_ctx->hwctx;
     VulkanDevicePriv *p = hwfc->device_ctx->internal->priv;
-    const VkImageDrmFormatModifierListCreateInfoEXT *modifier_info;
-    const int has_modifiers = !!(p->extensions & FF_VK_EXT_DRM_MODIFIER_FLAGS);
+    VkImageUsageFlagBits supported_usage;
 
-    /* Default tiling flags */
-    hwctx->tiling = hwctx->tiling ? hwctx->tiling :
-                    has_modifiers ? VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT :
-                    p->use_linear_images ? VK_IMAGE_TILING_LINEAR :
-                    VK_IMAGE_TILING_OPTIMAL;
+    /* Defaults */
+    if (!hwctx->nb_layers)
+        hwctx->nb_layers = 1;
+
+    /* VK_IMAGE_TILING_OPTIMAL == 0, so no need to check */
 
     if (!hwctx->usage)
-        hwctx->usage = FF_VK_DEFAULT_USAGE_FLAGS;
+        hwctx->usage = VK_IMAGE_USAGE_SAMPLED_BIT      |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
-    modifier_info = vk_find_struct(hwctx->create_pnext,
-                                   VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+    err = av_vkfmt_from_pixfmt2(hwfc->device_ctx, hwfc->sw_format, 0, /* drivers must fix feats. */
+                                &fp->fmts, &fp->nb_images, &fp->aspect, &supported_usage);
+    if (err < 0)
+        return err;
 
-    /* Get the supported modifiers if the user has not given any. */
-    if (has_modifiers && !modifier_info) {
-        const VkFormat *fmt = av_vkfmt_from_pixfmt(hwfc->sw_format);
-        VkImageDrmFormatModifierListCreateInfoEXT *modifier_info;
-        FFVulkanFunctions *vk = &p->vkfn;
-        VkDrmFormatModifierPropertiesEXT *mod_props;
-        uint64_t *modifiers;
-        int modifier_count = 0;
+    fp->fmt = vk_find_format_entry(hwfc->sw_format);
 
-        VkDrmFormatModifierPropertiesListEXT mod_props_list = {
-            .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
-            .pNext = NULL,
-            .drmFormatModifierCount = 0,
-            .pDrmFormatModifierProperties = NULL,
-        };
-        VkFormatProperties2 prop = {
-            .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
-            .pNext = &mod_props_list,
-        };
+    /* Remove comments once drivers properly signal features for formats */
+    if (fp->fmt->vk_planes > 1) // || supported_usage & VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR)
+        hwctx->usage |= VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR;
 
-        /* Get all supported modifiers */
-        vk->GetPhysicalDeviceFormatProperties2(dev_hwctx->phys_dev, fmt[0], &prop);
+//    fp->fmt = vk_find_format_entry(hwfc->sw_format);
 
-        if (!mod_props_list.drmFormatModifierCount) {
-            av_log(hwfc, AV_LOG_ERROR, "There are no supported modifiers for the given sw_format\n");
-            return AVERROR(EINVAL);
-        }
-
-        /* Createa structure to hold the modifier list info */
-        modifier_info = av_mallocz(sizeof(*modifier_info));
-        if (!modifier_info)
-            return AVERROR(ENOMEM);
-
-        modifier_info->pNext = NULL;
-        modifier_info->sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT;
-
-        /* Add structure to the image creation pNext chain */
-        if (!hwctx->create_pnext)
-            hwctx->create_pnext = modifier_info;
-        else
-            vk_link_struct(hwctx->create_pnext, (void *)modifier_info);
-
-        /* Backup the allocated struct to be freed later */
-        fp->modifier_info = modifier_info;
-
-        /* Allocate list of modifiers */
-        modifiers = av_mallocz(mod_props_list.drmFormatModifierCount *
-                               sizeof(*modifiers));
-        if (!modifiers)
-            return AVERROR(ENOMEM);
-
-        modifier_info->pDrmFormatModifiers = modifiers;
-
-        /* Allocate a temporary list to hold all modifiers supported */
-        mod_props = av_mallocz(mod_props_list.drmFormatModifierCount *
-                               sizeof(*mod_props));
-        if (!mod_props)
-            return AVERROR(ENOMEM);
-
-        mod_props_list.pDrmFormatModifierProperties = mod_props;
-
-        /* Finally get all modifiers from the device */
-        vk->GetPhysicalDeviceFormatProperties2(dev_hwctx->phys_dev, fmt[0], &prop);
-
-        /* Reject any modifiers that don't match our requirements */
-        for (int i = 0; i < mod_props_list.drmFormatModifierCount; i++) {
-            if (!(mod_props[i].drmFormatModifierTilingFeatures & hwctx->usage))
-                continue;
-
-            modifiers[modifier_count++] = mod_props[i].drmFormatModifier;
-        }
-
-        if (!modifier_count) {
-            av_log(hwfc, AV_LOG_ERROR, "None of the given modifiers supports"
-                                       " the usage flags!\n");
-            av_freep(&mod_props);
-            return AVERROR(EINVAL);
-        }
-
-        modifier_info->drmFormatModifierCount = modifier_count;
-        av_freep(&mod_props);
+    if (!hwctx->img_flags) {
+        hwctx->img_flags = VK_IMAGE_CREATE_ALIAS_BIT;
+        if ((fp->fmt->vk_planes > 1 && fp->nb_images == 1) ||
+            (fp->fmt->vkf != fp->fmt->fallback[0]))
+            hwctx->img_flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
+
+    if (!hwctx->lock_frame)
+        hwctx->lock_frame = lock_frame;
+
+    if (!hwctx->unlock_frame)
+        hwctx->unlock_frame = unlock_frame;
 
     err = create_exec_ctx(hwfc, &fp->conv_ctx,
                           dev_hwctx->queue_family_comp_index,
@@ -2509,8 +2486,8 @@ static int vulkan_frames_init(AVHWFramesContext *hwfc)
         return err;
 
     /* Test to see if allocation will fail */
-    err = create_frame(hwfc, &f, hwctx->tiling, hwctx->usage,
-                       hwctx->create_pnext);
+    err = create_frame(hwfc, &f, hwctx->tiling, hwctx->usage, hwctx->img_flags,
+                       hwctx->nb_layers, hwctx->create_pnext);
     if (err)
         return err;
 
@@ -2525,11 +2502,6 @@ static int vulkan_frames_init(AVHWFramesContext *hwfc)
         if (!hwfc->internal->pool_internal)
             return AVERROR(ENOMEM);
     }
-
-    if (!hwctx->lock_frame)
-        hwctx->lock_frame = lock_frame;
-    if (!hwctx->unlock_frame)
-        hwctx->unlock_frame = unlock_frame;
 
     return 0;
 }
@@ -2606,7 +2578,7 @@ static int vulkan_map_frame_to_mem(AVHWFramesContext *hwfc, AVFrame *dst,
                                    const AVFrame *src, int flags)
 {
     VkResult ret;
-    int err, mapped_mem_count = 0, mem_planes = 0;
+    int err, nb_mem = 0, mapped_mem_count = 0, mem_planes = 0;
     AVVkFrame *f = (AVVkFrame *)src->data[0];
     AVVulkanDeviceContext *hwctx = hwfc->device_ctx->hwctx;
     AVVulkanFramesContext *hwfctx = hwfc->hwctx;
@@ -2626,7 +2598,7 @@ static int vulkan_map_frame_to_mem(AVHWFramesContext *hwfc, AVFrame *dst,
     }
 
     if (!(f->flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ||
-        !(f->tiling == VK_IMAGE_TILING_LINEAR)) {
+        !(hwfctx->tiling == VK_IMAGE_TILING_LINEAR)) {
         av_log(hwfc, AV_LOG_ERROR, "Unable to map frame, not host visible "
                "and linear!\n");
         err = AVERROR(EINVAL);
@@ -2636,35 +2608,35 @@ static int vulkan_map_frame_to_mem(AVHWFramesContext *hwfc, AVFrame *dst,
     dst->width  = src->width;
     dst->height = src->height;
 
-    mem_planes = hwfctx->flags & AV_VK_FRAME_FLAG_CONTIGUOUS_MEMORY ? 1 : planes;
-    for (int i = 0; i < mem_planes; i++) {
+    for (int i = 0; i < AV_NUM_DATA_POINTERS; i++)
+        nb_mem += !!f->mem[i];
+
+    for (int i = 0; i < nb_mem; i++) {
         ret = vk->MapMemory(hwctx->act_dev, f->mem[i], 0,
                             VK_WHOLE_SIZE, 0, (void **)&dst->data[i]);
         if (ret != VK_SUCCESS) {
-            av_log(hwfc, AV_LOG_ERROR, "Failed to map image memory: %s\n",
-                vk_ret2str(ret));
+            av_log(hwfc, AV_LOG_ERROR, "Failed to map %ith frame memory: %s\n",
+                   i, vk_ret2str(ret));
             err = AVERROR_EXTERNAL;
             goto fail;
         }
         mapped_mem_count++;
     }
 
-    if (hwfctx->flags & AV_VK_FRAME_FLAG_CONTIGUOUS_MEMORY) {
-        for (int i = 0; i < planes; i++)
-            dst->data[i] = dst->data[0] + f->offset[i];
-    }
+    for (int i = 0; i < planes; i++)
+        dst->data[i] = dst->data[i] + f->offset[i];
 
     /* Check if the memory contents matter */
     if (((flags & AV_HWFRAME_MAP_READ) || !(flags & AV_HWFRAME_MAP_OVERWRITE)) &&
         !(f->flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
         VkMappedMemoryRange map_mem_ranges[AV_NUM_DATA_POINTERS] = { { 0 } };
-        for (int i = 0; i < planes; i++) {
+        for (int i = 0; i < nb_mem; i++) {
             map_mem_ranges[i].sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
             map_mem_ranges[i].size = VK_WHOLE_SIZE;
             map_mem_ranges[i].memory = f->mem[i];
         }
 
-        ret = vk->InvalidateMappedMemoryRanges(hwctx->act_dev, planes,
+        ret = vk->InvalidateMappedMemoryRanges(hwctx->act_dev, nb_mem,
                                                map_mem_ranges);
         if (ret != VK_SUCCESS) {
             av_log(hwfc, AV_LOG_ERROR, "Failed to invalidate memory: %s\n",
@@ -2706,25 +2678,25 @@ static void vulkan_unmap_from_drm(AVHWFramesContext *hwfc, HWMapDescriptor *hwma
 {
     AVVkFrame *f = hwmap->priv;
     AVVulkanDeviceContext *hwctx = hwfc->device_ctx->hwctx;
-    const int planes = av_pix_fmt_count_planes(hwfc->sw_format);
     VulkanDevicePriv *p = hwfc->device_ctx->internal->priv;
     FFVulkanFunctions *vk = &p->vkfn;
+    const int nb_images = ff_vk_count_images(f);
 
     VkSemaphoreWaitInfo wait_info = {
         .sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
         .flags          = 0x0,
         .pSemaphores    = f->sem,
         .pValues        = f->sem_value,
-        .semaphoreCount = planes,
+        .semaphoreCount = nb_images,
     };
 
     vk->WaitSemaphores(hwctx->act_dev, &wait_info, UINT64_MAX);
 
     vulkan_free_internal(f);
 
-    for (int i = 0; i < planes; i++) {
-        vk->DestroyImage(hwctx->act_dev, f->img[i], hwctx->alloc);
-        vk->FreeMemory(hwctx->act_dev, f->mem[i], hwctx->alloc);
+    for (int i = 0; i < nb_images; i++) {
+        vk->DestroyImage(hwctx->act_dev,     f->img[i], hwctx->alloc);
+        vk->FreeMemory(hwctx->act_dev,       f->mem[i], hwctx->alloc);
         vk->DestroySemaphore(hwctx->act_dev, f->sem[i], hwctx->alloc);
     }
 
@@ -3502,7 +3474,7 @@ static int vulkan_map_to_drm(AVHWFramesContext *hwfc, AVFrame *dst,
 
         drm_desc->layers[i].planes[0].object_index = FFMIN(i, drm_desc->nb_objects - 1);
 
-        if (f->tiling == VK_IMAGE_TILING_OPTIMAL)
+        if (hwfctx ->tiling == VK_IMAGE_TILING_OPTIMAL)
             continue;
 
         vk->GetImageSubresourceLayout(hwctx->act_dev, f->img[i], &sub, &layout);
@@ -3822,7 +3794,10 @@ static int transfer_image_buf(AVHWFramesContext *hwfc, AVFrame *f,
     int bar_num = 0;
     VkPipelineStageFlagBits sem_wait_dst[AV_NUM_DATA_POINTERS];
 
-    const int planes = av_pix_fmt_count_planes(pix_fmt);
+    const int img_planes = fp->fmt->vk_planes;
+    const int nb_images = ff_vk_count_images(frame);
+    int pixfmt_planes = av_pix_fmt_count_planes(pix_fmt);
+
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt);
 
     VkImageMemoryBarrier img_bar[AV_NUM_DATA_POINTERS] = { 0 };
@@ -3835,8 +3810,8 @@ static int transfer_image_buf(AVHWFramesContext *hwfc, AVFrame *f,
         .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
         .pWaitSemaphoreValues = frame->sem_value,
         .pSignalSemaphoreValues = sem_signal_values,
-        .waitSemaphoreValueCount = planes,
-        .signalSemaphoreValueCount = planes,
+        .waitSemaphoreValueCount = nb_images,
+        .signalSemaphoreValueCount = nb_images,
     };
 
     VkSubmitInfo s_info = {
@@ -3845,8 +3820,8 @@ static int transfer_image_buf(AVHWFramesContext *hwfc, AVFrame *f,
         .pSignalSemaphores    = frame->sem,
         .pWaitSemaphores      = frame->sem,
         .pWaitDstStageMask    = sem_wait_dst,
-        .signalSemaphoreCount = planes,
-        .waitSemaphoreCount   = planes,
+        .signalSemaphoreCount = nb_images,
+        .waitSemaphoreCount   = nb_images,
     };
 
     vkfc->lock_frame(hwfc, frame);
@@ -3854,11 +3829,11 @@ static int transfer_image_buf(AVHWFramesContext *hwfc, AVFrame *f,
     if ((err = wait_start_exec_ctx(hwfc, ectx)))
         goto end;
 
-    for (int i = 0; i < planes; i++)
+    for (int i = 0; i < nb_images; i++)
         sem_signal_values[i] = frame->sem_value[i] + 1;
 
     /* Change the image layout to something more optimal for transfers */
-    for (int i = 0; i < planes; i++) {
+    for (int i = 0; i < nb_images; i++) {
         VkImageLayout new_layout = to_buf ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL :
                                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         VkAccessFlags new_access = to_buf ? VK_ACCESS_TRANSFER_READ_BIT :
@@ -3894,13 +3869,19 @@ static int transfer_image_buf(AVHWFramesContext *hwfc, AVFrame *f,
                                0, NULL, 0, NULL, bar_num, img_bar);
 
     /* Schedule a copy for each plane */
-    for (int i = 0; i < planes; i++) {
+    for (int i = 0; i < pixfmt_planes; i++) {
+        int idx = FFMIN(i, nb_images - 1);
+        VkImageAspectFlags plane_aspect[] = { VK_IMAGE_ASPECT_COLOR_BIT,
+                                              VK_IMAGE_ASPECT_PLANE_0_BIT,
+                                              VK_IMAGE_ASPECT_PLANE_1_BIT,
+                                              VK_IMAGE_ASPECT_PLANE_2_BIT, };
+
         ImageBuffer *vkbuf = (ImageBuffer *)bufs[i]->data;
         VkBufferImageCopy buf_reg = {
             .bufferOffset = buf_offsets[i],
             .bufferRowLength = buf_stride[i] / desc->comp[i].step,
             .imageSubresource.layerCount = 1,
-            .imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .imageSubresource.aspectMask = plane_aspect[(img_planes != 1) + i*(img_planes != 1)],
             .imageOffset = { 0, 0, 0, },
         };
 
@@ -3911,11 +3892,11 @@ static int transfer_image_buf(AVHWFramesContext *hwfc, AVFrame *f,
         buf_reg.imageExtent = (VkExtent3D){ p_w, p_h, 1, };
 
         if (to_buf)
-            vk->CmdCopyImageToBuffer(cmd_buf, frame->img[i], frame->layout[i],
+            vk->CmdCopyImageToBuffer(cmd_buf, frame->img[idx], frame->layout[idx],
                                      vkbuf->buf, 1, &buf_reg);
         else
-            vk->CmdCopyBufferToImage(cmd_buf, vkbuf->buf, frame->img[i],
-                                     frame->layout[i], 1, &buf_reg);
+            vk->CmdCopyBufferToImage(cmd_buf, vkbuf->buf, frame->img[idx],
+                                     frame->layout[idx], 1, &buf_reg);
     }
 
     /* When uploading, do this asynchronously if the source is refcounted by
@@ -3932,7 +3913,7 @@ static int transfer_image_buf(AVHWFramesContext *hwfc, AVFrame *f,
             if ((err = add_buf_dep_exec_ctx(hwfc, ectx, &f->buf[ref], 1)))
                 goto end;
         }
-        if (ref && (err = add_buf_dep_exec_ctx(hwfc, ectx, bufs, planes)))
+        if (ref && (err = add_buf_dep_exec_ctx(hwfc, ectx, bufs, pixfmt_planes)))
             goto end;
         err = submit_exec_ctx(hwfc, ectx, &s_info, frame, !ref);
     } else {
@@ -3952,6 +3933,7 @@ static int vulkan_transfer_data(AVHWFramesContext *hwfc, const AVFrame *vkf,
     AVVkFrame *f = (AVVkFrame *)vkf->data[0];
     AVHWDeviceContext *dev_ctx = hwfc->device_ctx;
     AVVulkanDeviceContext *hwctx = dev_ctx->hwctx;
+    AVVulkanFramesContext *fc = hwfc->hwctx;
     VulkanDevicePriv *p = hwfc->device_ctx->internal->priv;
     FFVulkanFunctions *vk = &p->vkfn;
 
@@ -3974,7 +3956,7 @@ static int vulkan_transfer_data(AVHWFramesContext *hwfc, const AVFrame *vkf,
         return AVERROR(EINVAL);
 
     /* For linear, host visiable images */
-    if (f->tiling == VK_IMAGE_TILING_LINEAR &&
+    if (fc->tiling == VK_IMAGE_TILING_LINEAR &&
         f->flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
         AVFrame *map = av_frame_alloc();
         if (!map)
