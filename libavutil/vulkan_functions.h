@@ -42,6 +42,9 @@ typedef enum FFVulkanExtensions {
     FF_VK_EXT_VIDEO_DECODE_QUEUE     = 1ULL << 10, /* VK_KHR_video_decode_queue */
     FF_VK_EXT_VIDEO_DECODE_H264      = 1ULL << 11, /* VK_EXT_video_decode_h264 */
     FF_VK_EXT_VIDEO_DECODE_H265      = 1ULL << 12, /* VK_EXT_video_decode_h265 */
+    FF_VK_EXT_VIDEO_ENCODE_QUEUE     = 1ULL << 13, /* VK_KHR_video_encode_queue */
+    FF_VK_EXT_VIDEO_ENCODE_H264      = 1ULL << 14, /* VK_EXT_video_encode_h264 */
+    FF_VK_EXT_VIDEO_ENCODE_H265      = 1ULL << 15, /* VK_EXT_video_encode_h265 */
 
     FF_VK_EXT_NO_FLAG                = 1ULL << 31,
 } FFVulkanExtensions;
@@ -170,6 +173,18 @@ typedef enum FFVulkanExtensions {
                                                                                            \
     /* Video decoding */                                                                   \
     MACRO(1, 1, FF_VK_EXT_VIDEO_DECODE_QUEUE,   CmdDecodeVideoKHR)                         \
+                                                                                           \
+    /* Video encoding */                                                                   \
+    MACRO(1, 1, FF_VK_EXT_VIDEO_ENCODE_QUEUE,   CmdEncodeVideoKHR)                         \
+                                                                                           \
+    /* Queries */                                                                          \
+    MACRO(1, 1, FF_VK_EXT_NO_FLAG,              CreateQueryPool)                           \
+    MACRO(1, 1, FF_VK_EXT_NO_FLAG,              GetQueryPoolResults)                       \
+    MACRO(1, 1, FF_VK_EXT_NO_FLAG,              ResetQueryPool)                            \
+    MACRO(1, 1, FF_VK_EXT_NO_FLAG,              CmdBeginQuery)                             \
+    MACRO(1, 1, FF_VK_EXT_NO_FLAG,              CmdEndQuery)                               \
+    MACRO(1, 1, FF_VK_EXT_NO_FLAG,              CmdResetQueryPool)                         \
+    MACRO(1, 1, FF_VK_EXT_NO_FLAG,              DestroyQueryPool)                          \
                                                                                          \
     /* Pipeline */                                                                       \
     MACRO(1, 1, FF_VK_EXT_NO_FLAG,              CreatePipelineLayout)                    \
