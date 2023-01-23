@@ -32,7 +32,7 @@ static const VkExtensionProperties *dec_ext[] = {
     [AV_CODEC_ID_H264] = &ff_vk_dec_h264_ext,
 #endif
 #if CONFIG_HEVC_VULKAN_HWACCEL
-    [AV_CODEC_ID_AV1] = &ff_vk_dec_hevc_ext,
+    [AV_CODEC_ID_HEVC] = &ff_vk_dec_hevc_ext,
 #endif
 };
 
